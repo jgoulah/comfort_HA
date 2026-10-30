@@ -115,7 +115,7 @@ class CloudCommandTests(unittest.TestCase):
                 normalized = cloud_commands.normalize_cloud_commands(source)
 
                 self.assertEqual(normalized["operationMode"], "auto")
-                self.assertEqual(normalized["spHeat"], 14.4)
+                self.assertEqual(normalized["spHeat"], 14.5)
                 self.assertEqual(source["operationMode"], mode)
                 self.assertEqual(source["spHeat"], 14.444445)
 
@@ -123,7 +123,7 @@ class CloudCommandTests(unittest.TestCase):
         source = {"operationMode": "heat", "spHeat": 16, "spCool": 26.5}
         self.assertEqual(cloud_commands.normalize_cloud_commands(source), source)
 
-    def test_fahrenheit_conversions_are_quantized_to_cloud_increment(self) -> None:
+    def test_fahrenheit_conversions_use_mitsubishi_setpoint_table(self) -> None:
         source = {
             "spHeat": 15.555555555555555,
             "spCool": 23.88888888888889,
@@ -131,10 +131,21 @@ class CloudCommandTests(unittest.TestCase):
 
         self.assertEqual(
             cloud_commands.normalize_cloud_commands(source),
-            {"spHeat": 15.6, "spCool": 23.9},
+            {"spHeat": 15.5, "spCool": 24.0},
         )
         self.assertEqual(source["spHeat"], 15.555555555555555)
         self.assertEqual(source["spCool"], 23.88888888888889)
+
+    def test_nonstandard_fahrenheit_mappings_match_mitsubishi(self) -> None:
+        commands = {
+            "spHeat": (64 - 32) * 5 / 9,
+            "spCool": (70 - 32) * 5 / 9,
+        }
+
+        self.assertEqual(
+            cloud_commands.normalize_cloud_commands(commands),
+            {"spHeat": 17.5, "spCool": 21.5},
+        )
 
     def test_send_command_normalizes_at_cloud_boundary(self) -> None:
         api = object.__new__(api_module.KumoCloudAPI)
@@ -165,7 +176,7 @@ class CloudCommandTests(unittest.TestCase):
                 "deviceSerial": "serial",
                 "commands": {
                     "operationMode": "auto",
-                    "spHeat": 14.4,
+                    "spHeat": 14.5,
                     "spCool": 26.5,
                 },
             },

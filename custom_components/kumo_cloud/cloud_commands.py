@@ -3,15 +3,36 @@
 from __future__ import annotations
 
 import json
-from math import isfinite
+from math import isclose, isfinite
 import re
 from typing import Any
 
 from .const import OPERATION_MODE_AUTO
 
 REPORTED_AUTO_MODES = frozenset({OPERATION_MODE_AUTO, "autoCool", "autoHeat"})
-CLOUD_SETPOINT_PRECISION = 1
 _SETPOINT_COMMANDS = ("spCool", "spHeat", "spAuto")
+_MITSUBISHI_F_TO_C = {
+    61: 16.0,
+    62: 16.5,
+    63: 17.0,
+    64: 17.5,
+    65: 18.0,
+    66: 18.5,
+    67: 19.5,
+    68: 20.0,
+    69: 21.0,
+    70: 21.5,
+    71: 22.0,
+    72: 22.5,
+    73: 23.0,
+    74: 23.5,
+    75: 24.0,
+    76: 24.5,
+    77: 25.0,
+    78: 25.5,
+    79: 26.0,
+    80: 26.5,
+}
 
 _SENSITIVE_KEY_PARTS = (
     "access",
@@ -35,8 +56,10 @@ def normalize_cloud_commands(commands: dict[str, Any]) -> dict[str, Any]:
         normalized["operationMode"] = OPERATION_MODE_AUTO
 
     # Home Assistant converts whole Fahrenheit values to repeating Celsius
-    # floats (75 F -> 23.888...). The cloud accepts tenths of a degree and
+    # floats (75 F -> 23.888...). Kumo accepts 0.5 C setpoint increments and
     # rejects extra precision with invalidSpCoolIncrement/invalidSpHeatIncrement.
+    # For whole-F inputs, use Mitsubishi's proprietary mapping, which differs
+    # from ordinary rounding at 64-66 F and 69-72 F.
     for key in _SETPOINT_COMMANDS:
         value = normalized.get(key)
         if (
@@ -44,7 +67,14 @@ def normalize_cloud_commands(commands: dict[str, Any]) -> dict[str, Any]:
             and not isinstance(value, bool)
             and isfinite(value)
         ):
-            normalized[key] = round(value, CLOUD_SETPOINT_PRECISION)
+            fahrenheit = value * 9.0 / 5.0 + 32.0
+            whole_fahrenheit = round(fahrenheit)
+            if isclose(fahrenheit, whole_fahrenheit, abs_tol=1e-5):
+                normalized[key] = _MITSUBISHI_F_TO_C.get(
+                    whole_fahrenheit, round(value * 2.0) / 2.0
+                )
+            else:
+                normalized[key] = round(value * 2.0) / 2.0
     return normalized
 
 

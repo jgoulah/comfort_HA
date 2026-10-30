@@ -249,7 +249,7 @@ class ClimateAutoTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            device.sent_commands, [{"spHeat": 15.6, "spCool": 23.9}]
+            device.sent_commands, [{"spHeat": 15.5, "spCool": 24.0}]
         )
 
     def test_turn_on_normalizes_cached_auto_state_at_cloud_boundary(self) -> None:
