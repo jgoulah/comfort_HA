@@ -24,6 +24,7 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import KumoCloudDataUpdateCoordinator, KumoCloudDevice
+from .cloud_commands import REPORTED_AUTO_MODES
 from .const import (
     DOMAIN,
     OPERATION_MODE_OFF,
@@ -77,10 +78,7 @@ KUMO_TO_HVAC_MODE = {
     OPERATION_MODE_HEAT: HVACMode.HEAT,
     OPERATION_MODE_DRY: HVACMode.DRY,
     OPERATION_MODE_VENT: HVACMode.FAN_ONLY,
-    OPERATION_MODE_AUTO: HVACMode.HEAT_COOL,
-    "autoCool": HVACMode.HEAT_COOL,
-    "autoHeat": HVACMode.HEAT_COOL,
-    "auto": HVACMode.HEAT_COOL,
+    **{mode: HVACMode.HEAT_COOL for mode in REPORTED_AUTO_MODES},
 }
 
 HVAC_TO_KUMO_MODE = {
@@ -89,7 +87,9 @@ HVAC_TO_KUMO_MODE = {
     HVACMode.HEAT: OPERATION_MODE_HEAT,
     HVACMode.DRY: OPERATION_MODE_DRY,
     HVACMode.FAN_ONLY: OPERATION_MODE_VENT,
-    HVACMode.HEAT_COOL: "autoCool",  # this matches what your devices already use
+    # The cloud command API accepts "auto". autoCool/autoHeat are reported
+    # device states and remain supported by KUMO_TO_HVAC_MODE above.
+    HVACMode.HEAT_COOL: OPERATION_MODE_AUTO,
 }
 
 # Reverse mapping
@@ -294,7 +294,7 @@ class KumoCloudClimate(CoordinatorEntity, ClimateEntity):
             return HVACAction.DRYING
         elif operation_mode == OPERATION_MODE_VENT:
             return HVACAction.FAN
-        elif operation_mode == OPERATION_MODE_AUTO:
+        elif operation_mode in REPORTED_AUTO_MODES:
             # For auto mode, determine action based on current vs target temperature
             current_temp = self.current_temperature
             target_temp = self.target_temperature
@@ -441,21 +441,9 @@ class KumoCloudClimate(CoordinatorEntity, ClimateEntity):
         else:
             kumo_mode = HVAC_TO_KUMO_MODE.get(hvac_mode)
             if kumo_mode:
+                # Mode changes do not need setpoints. Replaying cached values can
+                # make an otherwise valid mode change fail range validation.
                 commands = {"operationMode": kumo_mode}
-
-                # Include current setpoints to maintain them
-                adapter = self.device.zone_data.get("adapter", {})
-                device_data = self.device.device_data
-
-                # Use device data if available, otherwise adapter data
-                sp_cool = device_data.get("spCool", adapter.get("spCool"))
-                sp_heat = device_data.get("spHeat", adapter.get("spHeat"))
-
-                if sp_cool is not None:
-                    commands["spCool"] = sp_cool
-                if sp_heat is not None:
-                    commands["spHeat"] = sp_heat
-
                 _LOGGER.info(
                     "[TEMPTRACE] async_set_hvac_mode built commands zone=%s serial=%s commands=%s",
                     self.device.zone_id,
@@ -567,18 +555,10 @@ class KumoCloudClimate(CoordinatorEntity, ClimateEntity):
         if operation_mode == OPERATION_MODE_OFF:
             operation_mode = OPERATION_MODE_COOL
 
-        commands = {"operationMode": operation_mode}
-
-        # Include setpoints
-        sp_cool = device_data.get("spCool", adapter.get("spCool"))
-        sp_heat = device_data.get("spHeat", adapter.get("spHeat"))
-
-        if sp_cool is not None:
-            commands["spCool"] = sp_cool
-        if sp_heat is not None:
-            commands["spHeat"] = sp_heat
-
-        await self._send_command_and_refresh(commands)
+        # Turning on only needs the last mode. Avoid replaying stale setpoints;
+        # cloud-boundary normalization converts returned autoCool/autoHeat state
+        # to the command API's canonical auto value.
+        await self._send_command_and_refresh({"operationMode": operation_mode})
 
     async def async_turn_off(self) -> None:
         """Turn the entity off."""

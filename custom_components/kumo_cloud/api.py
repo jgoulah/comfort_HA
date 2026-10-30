@@ -15,6 +15,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 
+from .cloud_commands import normalize_cloud_commands, sanitize_error_body
 from .const import (
     API_BASE_URL,
     API_VERSION,
@@ -254,8 +255,11 @@ class KumoCloudAPI:
                         async with self.session.get(url, headers=headers) as response:
                             if response.status == 429:
                                 got_429 = True
+                            elif response.status >= 400:
+                                await self._raise_request_error(
+                                    response, method, endpoint
+                                )
                             else:
-                                response.raise_for_status()
                                 result = await response.json()
                                 self._last_request_time = datetime.now()
                                 return result
@@ -265,8 +269,11 @@ class KumoCloudAPI:
                         ) as response:
                             if response.status == 429:
                                 got_429 = True
+                            elif response.status >= 400:
+                                await self._raise_request_error(
+                                    response, method, endpoint
+                                )
                             else:
-                                response.raise_for_status()
                                 result = (
                                     await response.json()
                                     if response.content_type == "application/json"
@@ -325,6 +332,30 @@ class KumoCloudAPI:
                         ) from err
                     raise KumoCloudConnectionError(f"HTTP error: {err.status}") from err
 
+    async def _raise_request_error(
+        self, response: aiohttp.ClientResponse, method: str, endpoint: str
+    ) -> None:
+        """Raise an API error that includes a redacted validation response."""
+        try:
+            response_body = await response.text()
+        except (UnicodeDecodeError, aiohttp.ClientError):
+            response_body = "<unreadable>"
+
+        detail = sanitize_error_body(response_body)
+        _LOGGER.error(
+            "Kumo Cloud API %s %s failed with HTTP %s; response: %s",
+            method.upper(),
+            endpoint,
+            response.status,
+            detail,
+        )
+
+        if response.status == 401:
+            raise KumoCloudAuthError("Authentication failed")
+        raise KumoCloudConnectionError(
+            f"HTTP error: {response.status}; response: {detail}"
+        )
+
     async def get_account_info(self) -> dict[str, Any]:
         """Get account information."""
         return await self._request("GET", "/accounts/me")
@@ -349,5 +380,8 @@ class KumoCloudAPI:
         self, device_serial: str, commands: dict[str, Any]
     ) -> dict[str, Any]:
         """Send command to device."""
-        data = {"deviceSerial": device_serial, "commands": commands}
+        data = {
+            "deviceSerial": device_serial,
+            "commands": normalize_cloud_commands(commands),
+        }
         return await self._request("POST", "/devices/send-command", data)
