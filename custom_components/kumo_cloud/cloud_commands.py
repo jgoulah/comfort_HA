@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+from math import isfinite
 import re
 from typing import Any
 
 from .const import OPERATION_MODE_AUTO
 
 REPORTED_AUTO_MODES = frozenset({OPERATION_MODE_AUTO, "autoCool", "autoHeat"})
+CLOUD_SETPOINT_PRECISION = 1
+_SETPOINT_COMMANDS = ("spCool", "spHeat", "spAuto")
 
 _SENSITIVE_KEY_PARTS = (
     "access",
@@ -30,6 +33,18 @@ def normalize_cloud_commands(commands: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(commands)
     if normalized.get("operationMode") in {"autoCool", "autoHeat"}:
         normalized["operationMode"] = OPERATION_MODE_AUTO
+
+    # Home Assistant converts whole Fahrenheit values to repeating Celsius
+    # floats (75 F -> 23.888...). The cloud accepts tenths of a degree and
+    # rejects extra precision with invalidSpCoolIncrement/invalidSpHeatIncrement.
+    for key in _SETPOINT_COMMANDS:
+        value = normalized.get(key)
+        if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and isfinite(value)
+        ):
+            normalized[key] = round(value, CLOUD_SETPOINT_PRECISION)
     return normalized
 
 

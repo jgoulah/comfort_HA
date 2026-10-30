@@ -222,7 +222,7 @@ class ClimateAutoTests(unittest.TestCase):
                 self.assertEqual(entity.hvac_mode, HVACMode.HEAT_COOL)
                 self.assertEqual(entity.hvac_action, HVACAction.IDLE)
 
-    def test_auto_range_preserves_requested_setpoints(self) -> None:
+    def test_auto_range_preserves_requested_setpoints_until_cloud_boundary(self) -> None:
         entity = climate.KumoCloudClimate(
             FakeDevice(operation_mode="autoCool", power=1)
         )
@@ -236,6 +236,21 @@ class ClimateAutoTests(unittest.TestCase):
         )
 
         self.assertEqual(sent, [{"spHeat": 14.444445, "spCool": 26.5}])
+
+    def test_auto_range_is_quantized_at_cloud_boundary(self) -> None:
+        device = FakeDevice(operation_mode="autoCool", power=1)
+        entity = climate.KumoCloudClimate(device)
+
+        asyncio.run(
+            entity.async_set_temperature(
+                target_temp_low=15.555555555555555,
+                target_temp_high=23.88888888888889,
+            )
+        )
+
+        self.assertEqual(
+            device.sent_commands, [{"spHeat": 15.6, "spCool": 23.9}]
+        )
 
     def test_turn_on_normalizes_cached_auto_state_at_cloud_boundary(self) -> None:
         device = FakeDevice(operation_mode="autoCool", power=0)

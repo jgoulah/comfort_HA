@@ -380,8 +380,15 @@ class KumoCloudAPI:
         self, device_serial: str, commands: dict[str, Any]
     ) -> dict[str, Any]:
         """Send command to device."""
+        normalized_commands = normalize_cloud_commands(commands)
+        if normalized_commands != commands:
+            _LOGGER.debug(
+                "Normalized Kumo Cloud command for %s: %s",
+                device_serial,
+                normalized_commands,
+            )
         data = {
             "deviceSerial": device_serial,
-            "commands": normalize_cloud_commands(commands),
+            "commands": normalized_commands,
         }
         return await self._request("POST", "/devices/send-command", data)
