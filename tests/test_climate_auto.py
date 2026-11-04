@@ -103,6 +103,11 @@ def _load_climate_module():
         UnitOfTemperature=types.SimpleNamespace(CELSIUS="°C"),
     )
     core = _install_module("homeassistant.core", HomeAssistant=object)
+    exceptions = _install_module(
+        "homeassistant.exceptions", HomeAssistantError=type(
+            "HomeAssistantError", (Exception,), {}
+        )
+    )
     helpers = _install_module("homeassistant.helpers")
     device_registry = _install_module(
         "homeassistant.helpers.device_registry", DeviceInfo=dict
@@ -120,6 +125,7 @@ def _load_climate_module():
     homeassistant.config_entries = config_entries
     homeassistant.const = ha_const
     homeassistant.core = core
+    homeassistant.exceptions = exceptions
     homeassistant.helpers = helpers
     components.climate = climate_package
     climate_package.const = climate_const
@@ -179,6 +185,16 @@ class FakeDevice:
         )
 
 
+class FailingAutoDevice(FakeDevice):
+    """Device that rejects Auto but accepts the fail-safe off command."""
+
+    async def send_command(self, commands) -> None:
+        normalized = climate_commands.normalize_cloud_commands(commands)
+        self.sent_commands.append(normalized)
+        if normalized.get("operationMode") == "auto":
+            raise RuntimeError("simulated Auto command failure")
+
+
 class ClimateAutoTests(unittest.TestCase):
     """Exercise all entity paths that can encounter an Auto mode."""
 
@@ -197,7 +213,16 @@ class ClimateAutoTests(unittest.TestCase):
 
         asyncio.run(entity.async_set_hvac_mode(HVACMode.HEAT_COOL))
 
-        self.assertEqual(sent, [{"operationMode": "auto"}])
+        self.assertEqual(
+            sent,
+            [
+                {
+                    "operationMode": "auto",
+                    "spHeat": 14.444445,
+                    "spCool": 26.5,
+                }
+            ],
+        )
 
     def test_heat_and_cool_mode_changes_remain_mode_only(self) -> None:
         for hvac_mode, cloud_mode in (
@@ -222,6 +247,15 @@ class ClimateAutoTests(unittest.TestCase):
                 self.assertEqual(entity.hvac_mode, HVACMode.HEAT_COOL)
                 self.assertEqual(entity.hvac_action, HVACAction.IDLE)
 
+    def test_reported_targets_prefer_fresher_adapter_band(self) -> None:
+        device = FakeDevice(operation_mode="autoCool", power=1)
+        device.zone_data["adapter"].update({"spHeat": 15.5, "spCool": 24.0})
+        device.device_data.update({"spHeat": 15.5, "spCool": 18.0})
+        entity = climate.KumoCloudClimate(device)
+
+        self.assertEqual(entity.target_temperature_low, 15.5)
+        self.assertEqual(entity.target_temperature_high, 24.0)
+
     def test_auto_range_preserves_requested_setpoints_until_cloud_boundary(self) -> None:
         entity = climate.KumoCloudClimate(
             FakeDevice(operation_mode="autoCool", power=1)
@@ -235,7 +269,16 @@ class ClimateAutoTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(sent, [{"spHeat": 14.444445, "spCool": 26.5}])
+        self.assertEqual(
+            sent,
+            [
+                {
+                    "operationMode": "auto",
+                    "spHeat": 14.444445,
+                    "spCool": 26.5,
+                }
+            ],
+        )
 
     def test_auto_range_is_quantized_at_cloud_boundary(self) -> None:
         device = FakeDevice(operation_mode="autoCool", power=1)
@@ -249,7 +292,8 @@ class ClimateAutoTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            device.sent_commands, [{"spHeat": 15.5, "spCool": 24.0}]
+            device.sent_commands,
+            [{"operationMode": "auto", "spHeat": 15.5, "spCool": 24.0}],
         )
 
     def test_turn_on_normalizes_cached_auto_state_at_cloud_boundary(self) -> None:
@@ -258,7 +302,35 @@ class ClimateAutoTests(unittest.TestCase):
 
         asyncio.run(entity.async_turn_on())
 
-        self.assertEqual(device.sent_commands, [{"operationMode": "auto"}])
+        self.assertEqual(
+            device.sent_commands,
+            [{"operationMode": "auto", "spHeat": 14.5, "spCool": 26.5}],
+        )
+
+    def test_failed_auto_command_immediately_turns_unit_off(self) -> None:
+        device = FailingAutoDevice()
+        entity = climate.KumoCloudClimate(device)
+
+        with self.assertRaises(RuntimeError):
+            asyncio.run(entity.async_set_hvac_mode(HVACMode.HEAT_COOL))
+
+        self.assertEqual(
+            device.sent_commands,
+            [
+                {"operationMode": "auto", "spHeat": 14.5, "spCool": 26.5},
+                {"operationMode": "off"},
+            ],
+        )
+
+    def test_invalid_cached_auto_band_is_refused_and_unit_stays_off(self) -> None:
+        device = FakeDevice()
+        device.zone_data["adapter"].update({"spHeat": 15.5, "spCool": 18.0})
+        entity = climate.KumoCloudClimate(device)
+
+        with self.assertRaises(climate.HomeAssistantError):
+            asyncio.run(entity.async_set_hvac_mode(HVACMode.HEAT_COOL))
+
+        self.assertEqual(device.sent_commands, [{"operationMode": "off"}])
 
 
 if __name__ == "__main__":

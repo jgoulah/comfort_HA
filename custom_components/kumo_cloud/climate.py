@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from math import isfinite
 import traceback
 from typing import Any
 
@@ -19,12 +20,13 @@ from homeassistant.components.climate.const import (
     ATTR_TARGET_TEMP_LOW,
 )
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import KumoCloudDataUpdateCoordinator, KumoCloudDevice
-from .cloud_commands import REPORTED_AUTO_MODES
+from .cloud_commands import REPORTED_AUTO_MODES, normalize_cloud_commands
 from .const import (
     DOMAIN,
     OPERATION_MODE_OFF,
@@ -206,16 +208,14 @@ class KumoCloudClimate(CoordinatorEntity, ClimateEntity):
     @property
     def target_temperature_low(self) -> float | None:
         """Return low target temperature (heat setpoint)."""
-        adapter = self.device.zone_data.get("adapter", {})
-        device_data = self.device.device_data
-        return device_data.get("spHeat", adapter.get("spHeat"))
+        heat, _ = self._current_auto_setpoints()
+        return heat
     
     @property
     def target_temperature_high(self) -> float | None:
         """Return high target temperature (cool setpoint)."""
-        adapter = self.device.zone_data.get("adapter", {})
-        device_data = self.device.device_data
-        return device_data.get("spCool", adapter.get("spCool"))
+        _, cool = self._current_auto_setpoints()
+        return cool
 
     @property
     def hvac_mode(self) -> HVACMode:
@@ -429,6 +429,99 @@ class KumoCloudClimate(CoordinatorEntity, ClimateEntity):
         )
         self.async_write_ha_state()
 
+    def _current_auto_setpoints(self) -> tuple[Any, Any]:
+        """Return one coherent heat/cool pair, preferring zone adapter data."""
+        adapter = self.device.zone_data.get("adapter", {})
+        device_data = self.device.device_data
+
+        for source in (adapter, device_data):
+            heat = source.get("spHeat")
+            cool = source.get("spCool")
+            if heat is not None and cool is not None:
+                return heat, cool
+
+        heat = adapter.get("spHeat")
+        cool = adapter.get("spCool")
+        return (
+            device_data.get("spHeat") if heat is None else heat,
+            device_data.get("spCool") if cool is None else cool,
+        )
+
+    def _validate_auto_setpoints(self, heat: Any, cool: Any) -> None:
+        """Validate a normalized Auto band without changing user targets."""
+        normalized = normalize_cloud_commands({"spHeat": heat, "spCool": cool})
+        normalized_heat = normalized.get("spHeat")
+        normalized_cool = normalized.get("spCool")
+
+        if (
+            isinstance(normalized_heat, bool)
+            or isinstance(normalized_cool, bool)
+            or not isinstance(normalized_heat, (int, float))
+            or not isinstance(normalized_cool, (int, float))
+            or not isfinite(normalized_heat)
+            or not isfinite(normalized_cool)
+        ):
+            raise HomeAssistantError("Auto mode requires both heat and cool setpoints")
+        if normalized_heat >= normalized_cool:
+            raise HomeAssistantError(
+                "Auto heat setpoint must be lower than the cool setpoint"
+            )
+
+        profile = self.device.profile_data
+        if not profile:
+            return
+
+        profile_data = profile[0] if isinstance(profile, list) else profile
+        minimums = profile_data.get("minimumSetPoints", {})
+        maximums = profile_data.get("maximumSetPoints", {})
+        violations = []
+
+        heat_min = minimums.get("heat")
+        heat_max = maximums.get("heat")
+        cool_min = minimums.get("cool")
+        cool_max = maximums.get("cool")
+
+        if heat_min is not None and normalized_heat < heat_min:
+            violations.append(f"heat {normalized_heat}°C is below {heat_min}°C")
+        if heat_max is not None and normalized_heat > heat_max:
+            violations.append(f"heat {normalized_heat}°C is above {heat_max}°C")
+        if cool_min is not None and normalized_cool < cool_min:
+            violations.append(f"cool {normalized_cool}°C is below {cool_min}°C")
+        if cool_max is not None and normalized_cool > cool_max:
+            violations.append(f"cool {normalized_cool}°C is above {cool_max}°C")
+
+        if violations:
+            raise HomeAssistantError(
+                f"Auto setpoint is outside the device profile: {', '.join(violations)}"
+            )
+
+    async def _send_auto_command_or_turn_off(self, heat: Any, cool: Any) -> None:
+        """Send Auto mode and its complete band, turning off on any failure."""
+        commands = {
+            "operationMode": OPERATION_MODE_AUTO,
+            "spHeat": heat,
+            "spCool": cool,
+        }
+
+        try:
+            self._validate_auto_setpoints(heat, cool)
+            await self._send_command_and_refresh(commands)
+        except Exception:
+            _LOGGER.exception(
+                "Auto command failed for device %s; turning it off as a fail-safe",
+                self.device.device_serial,
+            )
+            try:
+                await self._send_command_and_refresh(
+                    {"operationMode": OPERATION_MODE_OFF}
+                )
+            except Exception:
+                _LOGGER.exception(
+                    "Fail-safe turn-off also failed for device %s",
+                    self.device.device_serial,
+                )
+            raise
+
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         """Set new target HVAC mode."""
         _log_temp_context(
@@ -438,11 +531,12 @@ class KumoCloudClimate(CoordinatorEntity, ClimateEntity):
         )
         if hvac_mode == HVACMode.OFF:
             await self._send_command_and_refresh({"operationMode": OPERATION_MODE_OFF})
+        elif hvac_mode == HVACMode.HEAT_COOL:
+            heat, cool = self._current_auto_setpoints()
+            await self._send_auto_command_or_turn_off(heat, cool)
         else:
             kumo_mode = HVAC_TO_KUMO_MODE.get(hvac_mode)
             if kumo_mode:
-                # Mode changes do not need setpoints. Replaying cached values can
-                # make an otherwise valid mode change fail range validation.
                 commands = {"operationMode": kumo_mode}
                 _LOGGER.info(
                     "[TEMPTRACE] async_set_hvac_mode built commands zone=%s serial=%s commands=%s",
@@ -465,18 +559,12 @@ class KumoCloudClimate(CoordinatorEntity, ClimateEntity):
         high = kwargs.get(ATTR_TARGET_TEMP_HIGH)
 
         if low is not None or high is not None:
-            current_low = device_data.get("spHeat", adapter.get("spHeat"))
-            current_high = device_data.get("spCool", adapter.get("spCool"))
+            current_low, current_high = self._current_auto_setpoints()
 
             if low is None:
                 low = current_low
             if high is None:
                 high = current_high
-
-            if low is not None:
-                commands["spHeat"] = low
-            if high is not None:
-                commands["spCool"] = high
 
             _LOGGER.info(
                 "[TEMPTRACE] async_set_temperature RANGE zone=%s serial=%s "
@@ -490,8 +578,7 @@ class KumoCloudClimate(CoordinatorEntity, ClimateEntity):
                 commands,
             )
 
-            if commands:
-                await self._send_command_and_refresh(commands)
+            await self._send_auto_command_or_turn_off(low, high)
             return
 
         target_temp = kwargs.get(ATTR_TEMPERATURE)
@@ -516,8 +603,8 @@ class KumoCloudClimate(CoordinatorEntity, ClimateEntity):
                 commands["spCool"] = sp_cool
 
         elif hvac_mode == HVACMode.HEAT_COOL:
-            commands["spCool"] = target_temp
-            commands["spHeat"] = target_temp - 2
+            await self._send_auto_command_or_turn_off(target_temp - 2, target_temp)
+            return
 
         _LOGGER.info(
             "[TEMPTRACE] async_set_temperature SINGLE zone=%s serial=%s "
@@ -555,10 +642,11 @@ class KumoCloudClimate(CoordinatorEntity, ClimateEntity):
         if operation_mode == OPERATION_MODE_OFF:
             operation_mode = OPERATION_MODE_COOL
 
-        # Turning on only needs the last mode. Avoid replaying stale setpoints;
-        # cloud-boundary normalization converts returned autoCool/autoHeat state
-        # to the command API's canonical auto value.
-        await self._send_command_and_refresh({"operationMode": operation_mode})
+        if operation_mode in REPORTED_AUTO_MODES:
+            heat, cool = self._current_auto_setpoints()
+            await self._send_auto_command_or_turn_off(heat, cool)
+        else:
+            await self._send_command_and_refresh({"operationMode": operation_mode})
 
     async def async_turn_off(self) -> None:
         """Turn the entity off."""
