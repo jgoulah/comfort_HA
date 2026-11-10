@@ -147,6 +147,63 @@ class CloudCommandTests(unittest.TestCase):
             {"spHeat": 17.5, "spCool": 21.5},
         )
 
+    def test_table_celsius_displays_as_mitsubishi_fahrenheit(self) -> None:
+        for celsius, fahrenheit in (
+            (20.0, 68.0),
+            (21.0, 69.0),
+            (21.5, 70.0),
+            (22.0, 71.0),
+            (22.5, 72.0),
+            (16.0, 61.0),
+            (26.5, 80.0),
+        ):
+            with self.subTest(celsius=celsius):
+                self.assertEqual(
+                    cloud_commands.celsius_to_display_fahrenheit(celsius),
+                    fahrenheit,
+                )
+
+    def test_off_table_celsius_uses_plain_conversion(self) -> None:
+        # 20.5 C and 19.0 C are not on the table; 10 C is below it.
+        self.assertEqual(cloud_commands.celsius_to_display_fahrenheit(20.5), 68.9)
+        self.assertEqual(cloud_commands.celsius_to_display_fahrenheit(19.0), 66.2)
+        self.assertEqual(cloud_commands.celsius_to_display_fahrenheit(10), 50.0)
+        self.assertEqual(
+            cloud_commands.celsius_to_display_fahrenheit(21.04), 69.9
+        )
+        self.assertIsNone(cloud_commands.celsius_to_display_fahrenheit(None))
+
+    def test_whole_fahrenheit_converts_through_table(self) -> None:
+        for fahrenheit, celsius in ((68, 20.0), (69, 21.0), (71, 22.0), (69.0, 21.0)):
+            with self.subTest(fahrenheit=fahrenheit):
+                self.assertEqual(
+                    cloud_commands.fahrenheit_to_cloud_celsius(fahrenheit), celsius
+                )
+
+    def test_fractional_or_off_table_fahrenheit_is_quantized_at_boundary(self) -> None:
+        # 70.5 F -> 21.39 C -> 21.5 C at the boundary (shows as 70 F).
+        sent = cloud_commands.normalize_cloud_commands(
+            {"spHeat": cloud_commands.fahrenheit_to_cloud_celsius(70.5)}
+        )
+        self.assertEqual(sent, {"spHeat": 21.5})
+        sent = cloud_commands.normalize_cloud_commands(
+            {"spHeat": cloud_commands.fahrenheit_to_cloud_celsius(50)}
+        )
+        self.assertEqual(sent, {"spHeat": 10.0})
+
+    def test_table_round_trips_unchanged_through_normalization(self) -> None:
+        for fahrenheit in range(61, 81):
+            with self.subTest(fahrenheit=fahrenheit):
+                celsius = cloud_commands.fahrenheit_to_cloud_celsius(fahrenheit)
+                normalized = cloud_commands.normalize_cloud_commands(
+                    {"spHeat": celsius}
+                )["spHeat"]
+                self.assertEqual(normalized, celsius)
+                self.assertEqual(
+                    cloud_commands.celsius_to_display_fahrenheit(normalized),
+                    float(fahrenheit),
+                )
+
     def test_send_command_normalizes_at_cloud_boundary(self) -> None:
         api = object.__new__(api_module.KumoCloudAPI)
         captured = {}

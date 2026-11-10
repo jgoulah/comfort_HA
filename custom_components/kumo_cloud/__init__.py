@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from datetime import timedelta
 from typing import Any
 
@@ -14,7 +15,8 @@ from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import KumoCloudAPI, KumoCloudAuthError, KumoCloudConnectionError
-from .const import CONF_SITE_ID, DEFAULT_SCAN_INTERVAL, DOMAIN
+from .cloud_commands import normalize_cloud_commands
+from .const import CONF_SITE_ID, DEFAULT_SCAN_INTERVAL, DOMAIN, OPERATION_MODE_OFF
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -324,8 +326,42 @@ class KumoCloudDevice:
         """Return a unique ID for the device."""
         return f"{self.device_serial}_{self.zone_id}"
 
-    async def send_command(self, commands: dict[str, Any]) -> None:
-        """Send a command to the device and refresh status."""
+    def _apply_accepted_command(self, commands: dict[str, Any]) -> None:
+        """Cache the values of a command the cloud accepted.
+
+        The cloud reports the new state only on the next refresh. Caching the
+        accepted values lets the entity show them straight away; the refresh
+        that follows overwrites them with whatever the device reports.
+        """
+        accepted = normalize_cloud_commands(commands)
+        updates = {
+            key: accepted[key]
+            for key in ("operationMode", "spHeat", "spCool", "fanSpeed", "airDirection")
+            if key in accepted
+        }
+        if "operationMode" in updates:
+            updates["power"] = 0 if updates["operationMode"] == OPERATION_MODE_OFF else 1
+        if not updates:
+            return
+
+        device_data = self.coordinator.devices.get(self.device_serial)
+        if device_data is not None:
+            device_data.update(updates)
+        adapter = self.zone_data.get("adapter")
+        if adapter:
+            adapter.update(updates)
+
+    async def send_command(
+        self,
+        commands: dict[str, Any],
+        on_accepted: Callable[[], None] | None = None,
+    ) -> None:
+        """Send a command to the device and refresh status.
+
+        on_accepted runs right after the cloud accepts the command, once the
+        accepted values are cached, so the caller can write state while its
+        service call context is still current.
+        """
         try:
             # Send the command
             await self.coordinator.api.send_command(self.device_serial, commands)
@@ -334,6 +370,10 @@ class KumoCloudDevice:
                 self.device_serial,
                 commands,
             )
+
+            self._apply_accepted_command(commands)
+            if on_accepted is not None:
+                on_accepted()
 
             # Wait a moment for the command to be processed
             await asyncio.sleep(10)

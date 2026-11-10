@@ -26,7 +26,12 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import KumoCloudDataUpdateCoordinator, KumoCloudDevice
-from .cloud_commands import REPORTED_AUTO_MODES, normalize_cloud_commands
+from .cloud_commands import (
+    REPORTED_AUTO_MODES,
+    celsius_to_display_fahrenheit,
+    fahrenheit_to_cloud_celsius,
+    normalize_cloud_commands,
+)
 from .const import (
     DOMAIN,
     OPERATION_MODE_OFF,
@@ -131,7 +136,6 @@ async def async_setup_entry(
 class KumoCloudClimate(CoordinatorEntity, ClimateEntity):
     """Representation of a Kumo Cloud climate device."""
 
-    _attr_temperature_unit = UnitOfTemperature.CELSIUS
     _attr_has_entity_name = True
     _attr_name = None
 
@@ -188,14 +192,44 @@ class KumoCloudClimate(CoordinatorEntity, ClimateEntity):
         )
 
     @property
-    def current_temperature(self) -> float | None:
-        """Return the current temperature."""
+    def _use_fahrenheit(self) -> bool:
+        """Report in Fahrenheit when Home Assistant uses Fahrenheit.
+
+        Kumo Cloud works in Celsius, but Mitsubishi maps Fahrenheit through a
+        proprietary table. Reporting Celsius lets Home Assistant convert with
+        plain math, which shows 69-72 F setpoints one degree high.
+        """
+        hass = getattr(self, "hass", None)
+        if hass is None:
+            return False
+        return hass.config.units.temperature_unit == UnitOfTemperature.FAHRENHEIT
+
+    @property
+    def temperature_unit(self) -> str:
+        """Return the unit the entity reports temperatures in."""
+        if self._use_fahrenheit:
+            return UnitOfTemperature.FAHRENHEIT
+        return UnitOfTemperature.CELSIUS
+
+    def _to_ha(self, celsius: Any) -> Any:
+        """Convert a cloud Celsius value to the entity's unit."""
+        if celsius is None or not self._use_fahrenheit:
+            return celsius
+        return celsius_to_display_fahrenheit(celsius)
+
+    def _from_ha(self, value: Any) -> Any:
+        """Convert a value in the entity's unit to cloud Celsius."""
+        if value is None or not self._use_fahrenheit:
+            return value
+        return fahrenheit_to_cloud_celsius(value)
+
+    def _raw_current_temperature(self) -> float | None:
+        """Return the room temperature in cloud Celsius."""
         adapter = self.device.zone_data.get("adapter", {})
         return adapter.get("roomTemp")
 
-    @property
-    def target_temperature(self) -> float | None:
-        """Return the target temperature."""
+    def _raw_target_temperature(self) -> float | None:
+        """Return the active single setpoint in cloud Celsius."""
         adapter = self.device.zone_data.get("adapter", {})
         hvac_mode = self.hvac_mode
 
@@ -206,16 +240,26 @@ class KumoCloudClimate(CoordinatorEntity, ClimateEntity):
         return None
 
     @property
+    def current_temperature(self) -> float | None:
+        """Return the current temperature."""
+        return self._to_ha(self._raw_current_temperature())
+
+    @property
+    def target_temperature(self) -> float | None:
+        """Return the target temperature."""
+        return self._to_ha(self._raw_target_temperature())
+
+    @property
     def target_temperature_low(self) -> float | None:
         """Return low target temperature (heat setpoint)."""
         heat, _ = self._current_auto_setpoints()
-        return heat
-    
+        return self._to_ha(heat)
+
     @property
     def target_temperature_high(self) -> float | None:
         """Return high target temperature (cool setpoint)."""
         _, cool = self._current_auto_setpoints()
-        return cool
+        return self._to_ha(cool)
 
     @property
     def hvac_mode(self) -> HVACMode:
@@ -296,8 +340,10 @@ class KumoCloudClimate(CoordinatorEntity, ClimateEntity):
             return HVACAction.FAN
         elif operation_mode in REPORTED_AUTO_MODES:
             # For auto mode, determine action based on current vs target temperature
-            current_temp = self.current_temperature
-            target_temp = self.target_temperature
+            # Compare in cloud Celsius so the 1 degree band means the same
+            # thing regardless of the display unit.
+            current_temp = self._raw_current_temperature()
+            target_temp = self._raw_target_temperature()
 
             if current_temp is not None and target_temp is not None:
                 temp_diff = current_temp - target_temp
@@ -377,8 +423,10 @@ class KumoCloudClimate(CoordinatorEntity, ClimateEntity):
             profile_data = profile[0] if isinstance(profile, list) else profile
             min_setpoints = profile_data.get("minimumSetPoints", {})
             # Return the minimum of heat and cool setpoints
-            return min(min_setpoints.get("heat", 16), min_setpoints.get("cool", 16))
-        return 16.0
+            return self._to_ha(
+                min(min_setpoints.get("heat", 16), min_setpoints.get("cool", 16))
+            )
+        return self._to_ha(16.0)
 
     @property
     def max_temp(self) -> float:
@@ -388,12 +436,17 @@ class KumoCloudClimate(CoordinatorEntity, ClimateEntity):
             profile_data = profile[0] if isinstance(profile, list) else profile
             max_setpoints = profile_data.get("maximumSetPoints", {})
             # Return the maximum of heat and cool setpoints
-            return max(max_setpoints.get("heat", 30), max_setpoints.get("cool", 30))
-        return 30.0
+            return self._to_ha(
+                max(max_setpoints.get("heat", 30), max_setpoints.get("cool", 30))
+            )
+        return self._to_ha(30.0)
 
     @property
     def target_temperature_step(self) -> float:
         """Return the supported step of target temperature."""
+        if self._use_fahrenheit:
+            # Mitsubishi's Fahrenheit table is defined in whole degrees.
+            return 1.0
         return 0.5  # Kumo Cloud typically supports 0.5 degree steps
 
     @property
@@ -422,7 +475,14 @@ class KumoCloudClimate(CoordinatorEntity, ClimateEntity):
             stack,
         )
 
-        await self.device.send_command(commands)
+        # The device writes the commanded values as soon as the cloud accepts
+        # them, while this service call's context is still attached. The
+        # follow-up refresh comes ~10s later, after Home Assistant has
+        # dropped the context (5s), so without this the change shows up as
+        # external in the logbook.
+        await self.device.send_command(
+            commands, on_accepted=self.async_write_ha_state
+        )
 
         _log_temp_context(
             self.device, "_send_command_and_refresh AFTER", {"commands": commands}
@@ -554,9 +614,10 @@ class KumoCloudClimate(CoordinatorEntity, ClimateEntity):
 
         _log_temp_context(self.device, "async_set_temperature ENTRY", {"kwargs": kwargs})
 
+        # Requested values arrive in the entity's unit; work in cloud Celsius.
         # Range set (preferred for HEAT_COOL / auto)
-        low = kwargs.get(ATTR_TARGET_TEMP_LOW)
-        high = kwargs.get(ATTR_TARGET_TEMP_HIGH)
+        low = self._from_ha(kwargs.get(ATTR_TARGET_TEMP_LOW))
+        high = self._from_ha(kwargs.get(ATTR_TARGET_TEMP_HIGH))
 
         if low is not None or high is not None:
             current_low, current_high = self._current_auto_setpoints()
@@ -581,7 +642,7 @@ class KumoCloudClimate(CoordinatorEntity, ClimateEntity):
             await self._send_auto_command_or_turn_off(low, high)
             return
 
-        target_temp = kwargs.get(ATTR_TEMPERATURE)
+        target_temp = self._from_ha(kwargs.get(ATTR_TEMPERATURE))
         if target_temp is None:
             _LOGGER.info(
                 "[TEMPTRACE] async_set_temperature EXIT no target temp kwargs=%s", kwargs

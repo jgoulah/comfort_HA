@@ -33,6 +33,7 @@ _MITSUBISHI_F_TO_C = {
     79: 26.0,
     80: 26.5,
 }
+_MITSUBISHI_C_TO_F = {celsius: fahrenheit for fahrenheit, celsius in _MITSUBISHI_F_TO_C.items()}
 
 _SENSITIVE_KEY_PARTS = (
     "access",
@@ -76,6 +77,43 @@ def normalize_cloud_commands(commands: dict[str, Any]) -> dict[str, Any]:
             else:
                 normalized[key] = round(value * 2.0) / 2.0
     return normalized
+
+
+def celsius_to_display_fahrenheit(celsius: Any) -> Any:
+    """Convert a cloud Celsius value to the Fahrenheit Mitsubishi displays.
+
+    Values on Mitsubishi's table map exactly (21.0 C -> 69 F, where plain
+    conversion gives 69.8 and Home Assistant would show 70). Anything else
+    falls back to ordinary conversion.
+    """
+    if (
+        isinstance(celsius, bool)
+        or not isinstance(celsius, (int, float))
+        or not isfinite(celsius)
+    ):
+        return celsius
+    half_step = round(celsius * 2.0) / 2.0
+    if isclose(celsius, half_step, abs_tol=1e-5) and half_step in _MITSUBISHI_C_TO_F:
+        return float(_MITSUBISHI_C_TO_F[half_step])
+    return round(celsius * 9.0 / 5.0 + 32.0, 1)
+
+
+def fahrenheit_to_cloud_celsius(fahrenheit: Any) -> Any:
+    """Convert a Home Assistant Fahrenheit value to cloud Celsius.
+
+    Whole-degree values on Mitsubishi's table use it (69 F -> 21.0 C);
+    others convert normally and are quantized by normalize_cloud_commands.
+    """
+    if (
+        isinstance(fahrenheit, bool)
+        or not isinstance(fahrenheit, (int, float))
+        or not isfinite(fahrenheit)
+    ):
+        return fahrenheit
+    whole = round(fahrenheit)
+    if isclose(fahrenheit, whole, abs_tol=1e-5) and whole in _MITSUBISHI_F_TO_C:
+        return _MITSUBISHI_F_TO_C[whole]
+    return (fahrenheit - 32.0) * 5.0 / 9.0
 
 
 def _redact_json(value: Any) -> Any:

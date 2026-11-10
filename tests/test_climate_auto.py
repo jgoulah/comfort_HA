@@ -100,7 +100,7 @@ def _load_climate_module():
     ha_const = _install_module(
         "homeassistant.const",
         ATTR_TEMPERATURE="temperature",
-        UnitOfTemperature=types.SimpleNamespace(CELSIUS="°C"),
+        UnitOfTemperature=types.SimpleNamespace(CELSIUS="°C", FAHRENHEIT="°F"),
     )
     core = _install_module("homeassistant.core", HomeAssistant=object)
     exceptions = _install_module(
@@ -178,21 +178,25 @@ class FakeDevice:
         ]
         self.sent_commands = []
 
-    async def send_command(self, commands) -> None:
+    async def send_command(self, commands, on_accepted=None) -> None:
         """Model the cloud API boundary used by KumoCloudDevice."""
         self.sent_commands.append(
             climate_commands.normalize_cloud_commands(commands)
         )
+        if on_accepted is not None:
+            on_accepted()
 
 
 class FailingAutoDevice(FakeDevice):
     """Device that rejects Auto but accepts the fail-safe off command."""
 
-    async def send_command(self, commands) -> None:
+    async def send_command(self, commands, on_accepted=None) -> None:
         normalized = climate_commands.normalize_cloud_commands(commands)
         self.sent_commands.append(normalized)
         if normalized.get("operationMode") == "auto":
             raise RuntimeError("simulated Auto command failure")
+        if on_accepted is not None:
+            on_accepted()
 
 
 class ClimateAutoTests(unittest.TestCase):
@@ -331,6 +335,88 @@ class ClimateAutoTests(unittest.TestCase):
             asyncio.run(entity.async_set_hvac_mode(HVACMode.HEAT_COOL))
 
         self.assertEqual(device.sent_commands, [{"operationMode": "off"}])
+
+
+def _fahrenheit_hass():
+    """Minimal hass stand-in configured for US customary units."""
+    return types.SimpleNamespace(
+        config=types.SimpleNamespace(
+            units=types.SimpleNamespace(temperature_unit="°F")
+        )
+    )
+
+
+class ClimateFahrenheitTests(unittest.TestCase):
+    """Fahrenheit display and input go through Mitsubishi's table."""
+
+    def _entity(self, sp_heat=21.0, room=21.0):
+        device = FakeDevice(operation_mode="heat", power=1)
+        device.zone_data["adapter"].update({"spHeat": sp_heat, "roomTemp": room})
+        device.device_data.update({"spHeat": sp_heat})
+        entity = climate.KumoCloudClimate(device)
+        entity.hass = _fahrenheit_hass()
+        return entity, device
+
+    def test_reports_mitsubishi_fahrenheit(self) -> None:
+        entity, _ = self._entity(sp_heat=21.0, room=22.0)
+
+        self.assertEqual(entity.temperature_unit, "°F")
+        self.assertEqual(entity.target_temperature, 69.0)
+        self.assertEqual(entity.current_temperature, 71.0)
+        self.assertEqual(entity.target_temperature_step, 1.0)
+        self.assertEqual(entity.min_temp, 50.0)  # 10 C heat minimum
+        self.assertEqual(entity.max_temp, 86.0)  # 30 C cool maximum
+
+    def test_fahrenheit_setpoint_is_sent_as_table_celsius(self) -> None:
+        for fahrenheit, celsius in ((69, 21.0), (71, 22.0), (68, 20.0)):
+            with self.subTest(fahrenheit=fahrenheit):
+                entity, device = self._entity()
+
+                asyncio.run(entity.async_set_temperature(temperature=fahrenheit))
+
+                self.assertEqual(device.sent_commands[-1]["spHeat"], celsius)
+
+    def test_fahrenheit_range_is_sent_as_table_celsius(self) -> None:
+        device = FakeDevice(operation_mode="autoCool", power=1)
+        entity = climate.KumoCloudClimate(device)
+        entity.hass = _fahrenheit_hass()
+
+        asyncio.run(
+            entity.async_set_temperature(target_temp_low=69, target_temp_high=75)
+        )
+
+        self.assertEqual(
+            device.sent_commands,
+            [{"operationMode": "auto", "spHeat": 21.0, "spCool": 24.0}],
+        )
+
+    def test_celsius_installs_are_unchanged(self) -> None:
+        entity, device = self._entity(sp_heat=21.0, room=22.0)
+        entity.hass = types.SimpleNamespace(
+            config=types.SimpleNamespace(
+                units=types.SimpleNamespace(temperature_unit="°C")
+            )
+        )
+
+        self.assertEqual(entity.temperature_unit, "°C")
+        self.assertEqual(entity.target_temperature, 21.0)
+        self.assertEqual(entity.target_temperature_step, 0.5)
+        asyncio.run(entity.async_set_temperature(temperature=21.5))
+        self.assertEqual(device.sent_commands[-1]["spHeat"], 21.5)
+
+    def test_state_is_written_when_the_cloud_accepts(self) -> None:
+        entity, device = self._entity()
+        writes = []
+        entity.async_write_ha_state = lambda: writes.append(
+            list(device.sent_commands)
+        )
+
+        asyncio.run(entity.async_set_temperature(temperature=71))
+
+        # One write from inside send_command (context still attached), one
+        # after the refresh completes.
+        self.assertEqual(len(writes), 2)
+        self.assertEqual(writes[0], [device.sent_commands[0]])
 
 
 if __name__ == "__main__":
