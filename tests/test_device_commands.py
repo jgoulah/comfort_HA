@@ -90,6 +90,13 @@ class FakeApi:
     def __init__(self, fail: bool = False) -> None:
         self.fail = fail
         self.sent = []
+        # What the cloud reports on the next read; starts as the device state.
+        self.cloud = {
+            "operationMode": "off",
+            "power": 0,
+            "spHeat": 20.0,
+            "spCool": 25.0,
+        }
 
     async def send_command(self, device_serial, commands):
         if self.fail:
@@ -97,10 +104,13 @@ class FakeApi:
         self.sent.append((device_serial, commands))
         return {}
 
+    async def get_device_details(self, device_serial):
+        return dict(self.cloud)
 
-class FakeCoordinator:
+
+class FakeCoordinator(integration.KumoCloudDataUpdateCoordinator):
     def __init__(self, api: FakeApi) -> None:
-        self.api = api
+        super().__init__(None, api, "site")
         self.zones = [
             {
                 "id": "zone",
@@ -124,8 +134,12 @@ class FakeCoordinator:
         self.device_profiles = {}
         self.refreshes = []
 
+    def async_update_listeners(self):
+        pass
+
     async def async_refresh_device(self, device_serial):
         self.refreshes.append(device_serial)
+        await super().async_refresh_device(device_serial)
 
 
 class DeviceCommandTests(unittest.TestCase):
@@ -180,6 +194,42 @@ class DeviceCommandTests(unittest.TestCase):
 
         self.assertEqual(coordinator.devices["serial"]["power"], 0)
         self.assertEqual(coordinator.zones[0]["adapter"]["power"], 0)
+
+    def test_lagging_cloud_read_keeps_the_accepted_value(self) -> None:
+        device, coordinator = self._device()
+        coordinator.devices["serial"].update({"operationMode": "heat", "power": 1})
+        coordinator.api.cloud.update({"operationMode": "heat", "power": 1})
+
+        # The cloud still reports 20.0 at the post-command refresh.
+        self._send(device, {"spHeat": 22.0})
+
+        self.assertEqual(coordinator.devices["serial"]["spHeat"], 22.0)
+        self.assertEqual(coordinator.zones[0]["adapter"]["spHeat"], 22.0)
+
+    def test_pending_value_clears_once_the_cloud_reports_it(self) -> None:
+        device, coordinator = self._device()
+        self._send(device, {"spHeat": 22.0})
+        self.assertIn("serial", coordinator._pending)
+
+        coordinator.api.cloud["spHeat"] = 22.0
+        asyncio.run(coordinator.async_refresh_device("serial"))
+        self.assertNotIn("serial", coordinator._pending)
+
+        # Later changes made outside HA show up straight away.
+        coordinator.api.cloud["spHeat"] = 19.0
+        asyncio.run(coordinator.async_refresh_device("serial"))
+        self.assertEqual(coordinator.devices["serial"]["spHeat"], 19.0)
+
+    def test_pending_value_expires(self) -> None:
+        device, coordinator = self._device()
+        self._send(device, {"spHeat": 22.0})
+
+        later = integration.time.monotonic() + integration.PENDING_COMMAND_TIMEOUT + 1
+        with mock.patch.object(integration.time, "monotonic", return_value=later):
+            asyncio.run(coordinator.async_refresh_device("serial"))
+
+        self.assertEqual(coordinator.devices["serial"]["spHeat"], 20.0)
+        self.assertNotIn("serial", coordinator._pending)
 
     def test_rejected_command_changes_nothing(self) -> None:
         device, coordinator = self._device(fail=True)

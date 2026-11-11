@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Callable
 from datetime import timedelta
 from typing import Any
@@ -21,6 +22,10 @@ from .const import CONF_SITE_ID, DEFAULT_SCAN_INTERVAL, DOMAIN, OPERATION_MODE_O
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS: list[Platform] = [Platform.CLIMATE]
+
+# How long an accepted command's values win over cloud reads that don't show
+# them yet. The cloud can lag well past the 10s post-command refresh.
+PENDING_COMMAND_TIMEOUT = 90.0
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -99,6 +104,35 @@ class KumoCloudDataUpdateCoordinator(DataUpdateCoordinator):
         # Track consecutive failures to avoid marking unavailable on transient errors
         self._consecutive_failures = 0
         self._max_consecutive_failures = 5  # Only mark unavailable after 5 consecutive failures
+        # serial -> {key: (value, expires_at)} for accepted commands the cloud
+        # may not report yet.
+        self._pending: dict[str, dict[str, tuple[Any, float]]] = {}
+
+    def remember_accepted(self, device_serial: str, updates: dict[str, Any]) -> None:
+        """Hold accepted command values until the cloud reports them."""
+        expires = time.monotonic() + PENDING_COMMAND_TIMEOUT
+        pending = self._pending.setdefault(device_serial, {})
+        for key, value in updates.items():
+            pending[key] = (value, expires)
+
+    def _overlay_pending(self, device_serial: str, detail: dict[str, Any]) -> dict[str, Any]:
+        """Keep pending command values over a cloud read that lags behind.
+
+        A pending value is dropped once the cloud reports it or it expires.
+        """
+        pending = self._pending.get(device_serial)
+        if not pending:
+            return detail
+        now = time.monotonic()
+        for key in list(pending):
+            value, expires = pending[key]
+            if now >= expires or _same_value(detail.get(key), value):
+                del pending[key]
+            else:
+                detail[key] = value
+        if not pending:
+            del self._pending[device_serial]
+        return detail
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data from Kumo Cloud."""
@@ -122,7 +156,9 @@ class KumoCloudDataUpdateCoordinator(DataUpdateCoordinator):
                         device_detail_task, device_profile_task
                     )
 
-                    devices[device_serial] = device_detail
+                    devices[device_serial] = self._overlay_pending(
+                        device_serial, device_detail
+                    )
                     device_profiles[device_serial] = device_profile
 
             # Store the data for access by entities
@@ -208,11 +244,14 @@ class KumoCloudDataUpdateCoordinator(DataUpdateCoordinator):
             old_detail = dict(self.devices.get(device_serial, {}))
 
             device_detail = await self.api.get_device_details(device_serial)
+            fresh = dict(device_detail)
+            device_detail = self._overlay_pending(device_serial, device_detail)
 
             _LOGGER.info(
                 "[TEMPTRACE] refresh_device serial=%s "
                 "OLD(spHeat=%s spCool=%s roomTemp=%s power=%s mode=%s updatedAt=%s) "
-                "NEW(spHeat=%s spCool=%s roomTemp=%s power=%s mode=%s updatedAt=%s)",
+                "NEW(spHeat=%s spCool=%s roomTemp=%s power=%s mode=%s updatedAt=%s) "
+                "pending=%s",
                 device_serial,
                 old_detail.get("spHeat"),
                 old_detail.get("spCool"),
@@ -220,12 +259,13 @@ class KumoCloudDataUpdateCoordinator(DataUpdateCoordinator):
                 old_detail.get("power"),
                 old_detail.get("operationMode"),
                 old_detail.get("updatedAt"),
-                device_detail.get("spHeat"),
-                device_detail.get("spCool"),
-                device_detail.get("roomTemp"),
-                device_detail.get("power"),
-                device_detail.get("operationMode"),
-                device_detail.get("updatedAt"),
+                fresh.get("spHeat"),
+                fresh.get("spCool"),
+                fresh.get("roomTemp"),
+                fresh.get("power"),
+                fresh.get("operationMode"),
+                fresh.get("updatedAt"),
+                self._pending.get(device_serial),
             )
 
             # Update the cached device data
@@ -344,6 +384,7 @@ class KumoCloudDevice:
         if not updates:
             return
 
+        self.coordinator.remember_accepted(self.device_serial, updates)
         device_data = self.coordinator.devices.get(self.device_serial)
         if device_data is not None:
             device_data.update(updates)
@@ -386,3 +427,10 @@ class KumoCloudDevice:
                 "Failed to send command to device %s: %s", self.device_serial, err
             )
             raise
+
+
+def _same_value(reported: Any, expected: Any) -> bool:
+    """Compare a cloud value with a commanded one (setpoints as floats)."""
+    if isinstance(expected, (int, float)) and isinstance(reported, (int, float)):
+        return abs(float(reported) - float(expected)) < 0.01
+    return reported == expected
