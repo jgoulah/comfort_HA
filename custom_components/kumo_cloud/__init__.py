@@ -115,12 +115,40 @@ class KumoCloudDataUpdateCoordinator(DataUpdateCoordinator):
         for key, value in updates.items():
             pending[key] = (value, expires)
 
+    def _log_unrequested_mode_change(
+        self,
+        device_serial: str,
+        detail: dict[str, Any],
+        pending: dict[str, tuple[Any, float]],
+    ) -> None:
+        """Warn when the cloud reports a mode or power change HA did not send."""
+        old = self.devices.get(device_serial)
+        if not old or "operationMode" in pending or "power" in pending:
+            return
+        if (old.get("operationMode"), old.get("power")) == (
+            detail.get("operationMode"),
+            detail.get("power"),
+        ):
+            return
+        _LOGGER.warning(
+            "Kumo cloud reports %s changed outside HA: mode %s -> %s, power %s -> %s "
+            "(updatedAt %s -> %s)",
+            device_serial,
+            old.get("operationMode"),
+            detail.get("operationMode"),
+            old.get("power"),
+            detail.get("power"),
+            old.get("updatedAt"),
+            detail.get("updatedAt"),
+        )
+
     def _overlay_pending(self, device_serial: str, detail: dict[str, Any]) -> dict[str, Any]:
         """Keep pending command values over a cloud read that lags behind.
 
         A pending value is dropped once the cloud reports it or it expires.
         """
         pending = self._pending.get(device_serial)
+        self._log_unrequested_mode_change(device_serial, detail, pending or {})
         if not pending:
             return detail
         now = time.monotonic()
